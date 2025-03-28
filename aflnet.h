@@ -43,3 +43,16 @@ struct queue_entry {
   u8 is_initial_seed;                 /* Is this an initial seed */
   u32 unique_state_count;             /* Unique number of states traversed by this queue entry */
 };
+
+struct state_info_t {
+  u32 id;                     /* state id */
+  u8 is_covered;              /* has this state been covered */
+  u32 paths;                  /* total number of paths exercising this state */
+  u32 paths_discovered;       /* total number of new paths that have been discovered when this state is targeted/selected */
+  u32 selected_times;         /* total number of times this state has been targeted/selected */
+  u32 fuzzs;                  /* Total number of fuzzs (i.e., inputs generated) */
+  u32 score;                  /* current score of the state */
+  u32 selected_seed_index;    /* the recently selected seed index */
+  void **seeds;               /* keeps all seeds reaching this state -- can be casted to struct queue_entry* */
+  u32 seeds_count;            /* total number of seeds, it must be equal the size of the seeds array */
+};
