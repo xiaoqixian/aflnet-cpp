@@ -1,0 +1,14 @@
+[
+{
+  "directory": "/home/lunar/pros/aflnet-cpp/build",
+  "command": "/usr/bin/clang++-18  -I/home/lunar/pros/aflnet-cpp -std=gnu++20 -Wall -Wextra -Wpedantic -o CMakeFiles/afl-fuzz.dir/aflnet.cpp.o -c /home/lunar/pros/aflnet-cpp/aflnet.cpp",
+  "file": "/home/lunar/pros/aflnet-cpp/aflnet.cpp",
+  "output": "CMakeFiles/afl-fuzz.dir/aflnet.cpp.o"
+},
+{
+  "directory": "/home/lunar/pros/aflnet-cpp/build",
+  "command": "/usr/bin/clang++-18  -I/home/lunar/pros/aflnet-cpp -std=gnu++20 -Wall -Wextra -Wpedantic -o CMakeFiles/afl-fuzz.dir/afl-fuzz.cpp.o -c /home/lunar/pros/aflnet-cpp/afl-fuzz.cpp",
+  "file": "/home/lunar/pros/aflnet-cpp/afl-fuzz.cpp",
+  "output": "CMakeFiles/afl-fuzz.dir/afl-fuzz.cpp.o"
+}
+]
