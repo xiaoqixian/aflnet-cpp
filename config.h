@@ -11,6 +11,9 @@ constexpr size_t MAP_SIZE_POW2 = 16;
 constexpr size_t MAP_SIZE = 1 << MAP_SIZE_POW2;
 
 constexpr size_t MAX_FILE = 1 * 1024 * 1024;
+constexpr size_t SKIP_TO_NEW_PROB = 99;
+constexpr size_t SKIP_NFAV_NEW_PROB = 75;
+constexpr size_t SKIP_NFAV_OLD_PROB = 95;
 
 using u8 = uint8_t;
 using u16 = uint16_t;

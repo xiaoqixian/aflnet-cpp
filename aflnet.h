@@ -4,6 +4,8 @@
 
 #pragma once
 
+#include <list>
+#include <memory>
 #include <string>
 #include <vector>
 #include "config.h"
@@ -40,19 +42,33 @@ struct queue_entry {
   std::vector<region_t> regions;      /* Regions keeping information of message(s) sent to the server under test */
   u32 index;                          /* Index of this queue entry in the whole queue */
   u32 generating_state_id;            /* ID of the start at which the new seed was generated */
-  u8 is_initial_seed;                 /* Is this an initial seed */
+  bool is_initial_seed;                 /* Is this an initial seed */
   u32 unique_state_count;             /* Unique number of states traversed by this queue entry */
 };
 
 struct state_info_t {
   u32 id;                     /* state id */
-  u8 is_covered;              /* has this state been covered */
+  bool is_covered;              /* has this state been covered */
   u32 paths;                  /* total number of paths exercising this state */
   u32 paths_discovered;       /* total number of new paths that have been discovered when this state is targeted/selected */
   u32 selected_times;         /* total number of times this state has been targeted/selected */
   u32 fuzzs;                  /* Total number of fuzzs (i.e., inputs generated) */
   u32 score;                  /* current score of the state */
   u32 selected_seed_index;    /* the recently selected seed index */
-  void **seeds;               /* keeps all seeds reaching this state -- can be casted to struct queue_entry* */
-  u32 seeds_count;            /* total number of seeds, it must be equal the size of the seeds array */
+  std::vector<std::shared_ptr<queue_entry>> seeds;
 };
+
+enum class FuzzedState: u8 {
+  Unreachable = 0,
+  ReachableNotFuzzed,
+  Fuzzed
+};
+
+std::string state_sequence_to_string(std::vector<u32> const& state_seq);
+
+u32 save_messages_to_file(
+  std::list<std::vector<u8>> const& messages,
+  std::string const& fname,
+  bool replay_enabled,
+  u32 max_count
+);
