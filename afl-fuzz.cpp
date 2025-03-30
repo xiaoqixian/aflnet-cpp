@@ -102,7 +102,10 @@ void expand_was_fuzzed_map(u32 new_states, u32 new_qentries) {
     fuzz_map.resize(fuzzed_map_size + new_qentries, FuzzedState::Unreachable);
   }
 
-  was_fuzzed_map.emplace_back(fuzzed_map_size + new_qentries, FuzzedState::Unreachable);
+  was_fuzzed_map.reserve(was_fuzzed_map.size() + new_states);
+  for (size_t i = 0; i < new_states; i++) {
+    was_fuzzed_map.emplace_back(fuzzed_map_size + new_qentries, FuzzedState::Unreachable);
+  }
 }
 
 static bool is_state_sequence_interesting(StateSeq const& state_seq) {
@@ -358,9 +361,9 @@ static void update_state_aware_variables(std::shared_ptr<queue_entry> q, bool dr
         std::snprintf(from_state, STATE_STR_LEN, "%d", prev_state_id);
         std::snprintf(to_state, STATE_STR_LEN, "%d", curr_state_id);
 
-        std::array<std::tuple<char*, u32>, 2> from_to = {
-          std::tuple<char*, u32> {from_state, prev_state_id}, 
-          std::tuple<char*, u32> {to_state, curr_state_id}
+        std::array<std::pair<char*, u32>, 2> from_to = {
+          std::pair<char*, u32> {from_state, prev_state_id}, 
+          std::pair<char*, u32> {to_state, curr_state_id}
         };
         std::array<Agnode_t*, 2> graph_nodes;
         size_t emplace_idx = 0;
@@ -433,8 +436,7 @@ static void update_state_aware_variables(std::shared_ptr<queue_entry> q, bool dr
 
   // Now update other states
   for (size_t i = 0; i < q->regions.size(); i++) {
-    auto const region_state_count = q->regions[i].state_seq.size();
-    if (region_state_count > 0) {
+    if (!q->regions[i].state_seq.empty()) {
       auto const reachable_state_id = q->regions[i].state_seq.back();
       auto const it = state_map.find(reachable_state_id);
       if (it != state_map.end()) {
