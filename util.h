@@ -6,6 +6,10 @@
 #include <cassert>
 #include <cstddef>
 #include <utility>
+#include <string>
+
+#define STRINGIFY_INTERNAL(x) #x
+#define STRINGIFY(x) STRINGIFY_INTERNAL(x)
 
 template <typename T, size_t N>
 class stack_vec {
@@ -33,5 +37,11 @@ public:
   }
 };
 
-#define likely(_x)   __builtin_expect(!!(_x), 1)
-#define unlikely(_x)  __builtin_expect(!!(_x), 0)
+template<typename... Args>
+inline std::string alloc_printf(const char* fmt, Args... args) {
+    int len = std::snprintf(nullptr, 0, fmt, args...);
+    std::string buf(len, '\0');
+    std::snprintf(&buf[0], len + 1, fmt, args...);
+    return buf;
+}
+

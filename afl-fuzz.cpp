@@ -8,17 +8,23 @@
 #include <cmath>
 #include <csignal>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <exception>
 #include <functional>
 #include <list>
 #include <memory>
+#include <sched.h>
+#include <sys/resource.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <sstream>
+#include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/ipc.h>
 #include <sys/shm.h>
+#include <sys/wait.h>
 #include <unordered_map>
 #include <unordered_set>
 #include <random>
@@ -28,6 +34,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/time.h>
+#include <filesystem>
 
 #include "aflnet.h"
 #include "config.h"
@@ -50,8 +57,6 @@ enum class Protocol: u8 {
   UDP
 };
 
-static constexpr size_t STATE_STR_LEN = 12;
-
 static std::unordered_set<u32> ipsm_paths;
 static std::function<StateSeq(u8*, size_t)> extract_response_codes;
 static std::function<std::vector<region_t>(u8*, size_t)> extract_requests;
@@ -70,6 +75,7 @@ static u32 target_state_id;
 
 static size_t max_seed_region_count = 0;
 
+static std::string in_dir;
 static char const* out_dir = nullptr;
 static std::string ipsm_dot_fname;
 
@@ -77,6 +83,7 @@ static std::vector<u8> response_buf;
 static std::vector<size_t> response_bytes;
 
 static size_t message_sent = 0;
+static size_t queued_favored = 0;
 
 static size_t server_wait_usecs = 10000;
 static size_t socket_timeout_usecs = 1000;
@@ -86,16 +93,26 @@ static u16 net_port;
 static char const* net_ip;
 static u16 local_port;
 
+static pid_t forksrv_pid;
 static pid_t child_pid;
+
+static bool child_timed_out = false;
 
 static u32 cur_depth = 0;
 static u32 max_depth = 0;
 
 static u64 last_path_time = 0;
 
+static size_t mem_limit = MEM_LIMIT;
+
+static const char* doc_path = "docs";
+
 // Options
 static bool false_negative_reduction = false;
 static bool terminate_child = false;
+static bool dumb_mode = false;
+
+static bool uses_asan;
 
 using BitMap = std::array<u8, MAP_SIZE>;
 static BitMap session_virgin_bits;
@@ -108,8 +125,16 @@ static bool score_changed = false;
 std::array<std::shared_ptr<queue_entry>, MAP_SIZE> top_rated {};
 
 static u8* trace_bits;
+static u8* in_bitmap;
 
 static u32 shm_id;
+static int dev_null_fd = -1;
+static int fsrv_st_fd = -1;
+static int fsrv_ctl_fd = -1;
+
+static const char* target_path = NULL;
+
+static u32 exec_tmout = EXEC_TIMEOUT;
 
 /* Though its called a queue, I feel like it acts like a all push 
  * from back container.*/
@@ -120,12 +145,151 @@ static inline u8 has_new_bits(BitMap& virgin_map);
 static std::vector<region_t> convert_messages_to_regions();
 static void save_regions_to_file(std::string const& fname, std::list<std::vector<u8>> const& messages);
 
+/* Describe integer. Uses 12 cyclic static buffers for return values. The value
+   returned should be five characters or less for all the integers we reasonably
+   expect to see. */
+
+static char* DI(u64 val) {
+
+  static std::array<char[16], 12> tmp;
+  static char cur;
+
+  cur = (cur + 1) % 12;
+
+#define CHK_FORMAT(_divisor, _limit_mult, _fmt, _cast) do { \
+    if (val < (_divisor) * (_limit_mult)) { \
+      std::sprintf(static_cast<char*>(tmp[cur]), _fmt, ((_cast)val) / (_divisor)); \
+      return tmp[cur]; \
+    } \
+  } while (0)
+
+  /* 0-9999 */
+  CHK_FORMAT(1, 10000, "%llu", u64);
+
+  /* 10.0k - 99.9k */
+  CHK_FORMAT(1000, 99.95, "%0.01fk", double);
+
+  /* 100k - 999k */
+  CHK_FORMAT(1000, 1000, "%lluk", u64);
+
+  /* 1.00M - 9.99M */
+  CHK_FORMAT(1000 * 1000, 9.995, "%0.02fM", double);
+
+  /* 10.0M - 99.9M */
+  CHK_FORMAT(1000 * 1000, 99.95, "%0.01fM", double);
+
+  /* 100M - 999M */
+  CHK_FORMAT(1000 * 1000, 1000, "%lluM", u64);
+
+  /* 1.00G - 9.99G */
+  CHK_FORMAT(1000LL * 1000 * 1000, 9.995, "%0.02fG", double);
+
+  /* 10.0G - 99.9G */
+  CHK_FORMAT(1000LL * 1000 * 1000, 99.95, "%0.01fG", double);
+
+  /* 100G - 999G */
+  CHK_FORMAT(1000LL * 1000 * 1000, 1000, "%lluG", u64);
+
+  /* 1.00T - 9.99G */
+  CHK_FORMAT(1000LL * 1000 * 1000 * 1000, 9.995, "%0.02fT", double);
+
+  /* 10.0T - 99.9T */
+  CHK_FORMAT(1000LL * 1000 * 1000 * 1000, 99.95, "%0.01fT", double);
+
+  /* 100T+ */
+  strcpy(tmp[cur], "infty");
+  return tmp[cur];
+
+}
+
+
+/* Describe float. Similar to the above, except with a single
+   static buffer. */
+
+static char* DF(double val) {
+
+  static char tmp[16];
+
+  if (val < 99.995) {
+    sprintf(tmp, "%0.02f", val);
+    return tmp;
+  }
+
+  if (val < 999.95) {
+    sprintf(tmp, "%0.01f", val);
+    return tmp;
+  }
+
+  return DI((u64)val);
+
+}
+
+
+/* Describe integer as memory size. */
+
+static char* DMS(u64 val) {
+
+  static std::array<char[16], 12> tmp;
+  static char cur;
+
+  cur = (cur + 1) % 12;
+
+  /* 0-9999 */
+  CHK_FORMAT(1, 10000, "%llu B", u64);
+
+  /* 10.0k - 99.9k */
+  CHK_FORMAT(1024, 99.95, "%0.01f kB", double);
+
+  /* 100k - 999k */
+  CHK_FORMAT(1024, 1000, "%llu kB", u64);
+
+  /* 1.00M - 9.99M */
+  CHK_FORMAT(1024 * 1024, 9.995, "%0.02f MB", double);
+
+  /* 10.0M - 99.9M */
+  CHK_FORMAT(1024 * 1024, 99.95, "%0.01f MB", double);
+
+  /* 100M - 999M */
+  CHK_FORMAT(1024 * 1024, 1000, "%llu MB", u64);
+
+  /* 1.00G - 9.99G */
+  CHK_FORMAT(1024LL * 1024 * 1024, 9.995, "%0.02f GB", double);
+
+  /* 10.0G - 99.9G */
+  CHK_FORMAT(1024LL * 1024 * 1024, 99.95, "%0.01f GB", double);
+
+  /* 100G - 999G */
+  CHK_FORMAT(1024LL * 1024 * 1024, 1000, "%llu GB", u64);
+
+  /* 1.00T - 9.99G */
+  CHK_FORMAT(1024LL * 1024 * 1024 * 1024, 9.995, "%0.02f TB", double);
+
+  /* 10.0T - 99.9T */
+  CHK_FORMAT(1024LL * 1024 * 1024 * 1024, 99.95, "%0.01f TB", double);
+
+#undef CHK_FORMAT
+
+  /* 100T+ */
+  strcpy(tmp[cur], "infty");
+  return tmp[cur];
+
+}
+
+
 template <typename T = size_t>
 static T gen_random(T max, T min = 0) {
     static std::random_device rd;
     static std::mt19937 gen(rd());
     std::uniform_int_distribution<T> dis(min, max);
     return dis(gen);
+}
+
+static int check_open(const char* fname, const int mode) {
+  int fd = open(fname, mode);
+  if (fd < 0) {
+    PFATAL("Open %s failed", fname);
+  }
+  return fd;
 }
 
 static void setup_fnames() {
@@ -203,6 +367,7 @@ static void update_region_annotations(queue_entry& q) {
 /**
  * Choose a region data for region-level mutations
  */
+[[maybe_unused]]
 static std::vector<u8> choose_source_region() {
   assert(!queue.empty());
   auto index = gen_random(queue.size());
@@ -232,6 +397,7 @@ static std::vector<u8> choose_source_region() {
 /**
  * Update state.fuzzs when visiting specific state
  */
+[[maybe_unused]]
 static void update_fuzzs() {
   auto const state_seq = extract_response_codes(response_buf.data(), response_buf.size());
   std::unordered_set<u32> state_id_set;
@@ -282,6 +448,7 @@ static u32 update_scores_and_select_next_state(SelectMode const mode) {
   return result;
 }
 
+[[maybe_unused]]
 static u32 choose_target_state(SelectMode const mode) {
   switch (mode) {
     case SelectMode::Random:
@@ -313,6 +480,7 @@ static u32 choose_target_state(SelectMode const mode) {
  * Select a seed to exercise the target state, 
  * return the seed index in the queue.
  */
+[[maybe_unused]]
 static std::shared_ptr<queue_entry> choose_seed(u32 const target_state_id, SelectMode const mode) {
   auto& state = state_map[target_state_id];
 
@@ -391,6 +559,7 @@ static std::shared_ptr<queue_entry> choose_seed(u32 const target_state_id, Selec
   assert(false);
 }
 
+[[maybe_unused]]
 static void update_state_aware_variables(std::shared_ptr<queue_entry> q, bool dry_run) {
   if (response_buf.empty()) return;
 
@@ -545,6 +714,7 @@ static void update_state_aware_variables(std::shared_ptr<queue_entry> q, bool dr
  * Send messages over network, returns a bool to represent if the 
  * communication is successful.
  */
+[[maybe_unused]]
 static bool send_over_network() {
   bool likely_buggy = false;
   
@@ -666,6 +836,7 @@ static u64 get_cur_time(void) {
 
 /* Get unix time in microseconds */
 
+[[maybe_unused]]
 static u64 get_cur_time_us(void) {
 
   struct timeval tv;
@@ -674,6 +845,14 @@ static u64 get_cur_time_us(void) {
   gettimeofday(&tv, &tz);
 
   return (tv.tv_sec * 1000000ULL) + tv.tv_usec;
+}
+
+static void mark_as_redundant(queue_entry& q, bool favored) {
+  if (q.favored == favored) return;
+
+  q.fs_redundant = favored;
+
+  TODO();
 }
 
 static void add_to_queue(std::string const& fname, size_t len, bool passed_det, u8 corpus_read_or_sync) {
@@ -756,9 +935,9 @@ static inline u8 has_new_bits(BitMap& virgin_map) {
        that have not been already cleared from the virgin map - since this will
        almost always be the case. */
 
-    if (unlikely(*current) && unlikely(*current & *virgin)) {
+    if (*current && (*current & *virgin)) [[unlikely]] {
 
-      if (likely(ret < 2)) {
+      if (ret < 2) [[likely]] {
 
         u8* cur = (u8*)current;
         u8* vir = (u8*)virgin;
@@ -802,6 +981,7 @@ static inline u8 has_new_bits(BitMap& virgin_map) {
 /* Count the number of bits set in the provided bitmap. Used for the status
    screen several times every second, does not have to be fast. */
 
+[[maybe_unused]]
 static u32 count_bits(u8* mem) {
 
   u32* ptr = (u32*)mem;
@@ -832,11 +1012,13 @@ static u32 count_bits(u8* mem) {
 
 
 #define FF(_b)  (0xff << ((_b) << 3))
+#define UFF(_b)  (0xffu << ((_b) << 3))
 
 /* Count the number of bytes set in the bitmap. Called fairly sporadically,
    mostly to update the status screen or calibrate and examine confirmed
    new paths. */
 
+[[maybe_unused]]
 static u32 count_bytes(u8* mem) {
 
   u32* ptr = (u32*)mem;
@@ -848,10 +1030,10 @@ static u32 count_bytes(u8* mem) {
     u32 v = *(ptr++);
 
     if (!v) continue;
-    if (v & FF(0)) ret++;
-    if (v & FF(1)) ret++;
-    if (v & FF(2)) ret++;
-    if (v & FF(3)) ret++;
+    if (v & UFF(0)) ret++;
+    if (v & UFF(1)) ret++;
+    if (v & UFF(2)) ret++;
+    if (v & UFF(3)) ret++;
 
   }
 
@@ -863,6 +1045,7 @@ static u32 count_bytes(u8* mem) {
 /* Count the number of non-255 bytes set in the bitmap. Used strictly for the
    status screen, several calls per second or so. */
 
+[[maybe_unused]]
 static u32 count_non_255_bytes(u8* mem) {
 
   u32* ptr = (u32*)mem;
@@ -877,10 +1060,10 @@ static u32 count_non_255_bytes(u8* mem) {
        case. */
 
     if (v == 0xffffffff) continue;
-    if ((v & FF(0)) != FF(0)) ret++;
-    if ((v & FF(1)) != FF(1)) ret++;
-    if ((v & FF(2)) != FF(2)) ret++;
-    if ((v & FF(3)) != FF(3)) ret++;
+    if ((v & UFF(0)) != UFF(0)) ret++;
+    if ((v & UFF(1)) != UFF(1)) ret++;
+    if ((v & UFF(2)) != UFF(2)) ret++;
+    if ((v & UFF(3)) != UFF(3)) ret++;
 
   }
 
@@ -934,6 +1117,7 @@ static void simplify_trace(u64* mem) {
 
 #else
 
+[[maybe_unused]]
 static void simplify_trace(u32* mem) {
 
   u32 i = MAP_SIZE >> 2;
@@ -942,7 +1126,7 @@ static void simplify_trace(u32* mem) {
 
     /* Optimize for sparse bitmaps. */
 
-    if (unlikely(*mem)) {
+    if (*mem) [[unlikely]] {
 
       u8* mem8 = (u8*)mem;
 
@@ -1026,6 +1210,7 @@ static inline void classify_counts(u64* mem) {
 
 #else
 
+[[maybe_unused]]
 static inline void classify_counts(u32* mem) {
 
   u32 i = MAP_SIZE >> 2;
@@ -1034,7 +1219,7 @@ static inline void classify_counts(u32* mem) {
 
     /* Optimize for sparse bitmaps. */
 
-    if (unlikely(*mem)) {
+    if (*mem) [[unlikely]] {
 
       u16* mem16 = (u16*)mem;
 
@@ -1081,6 +1266,7 @@ static void minimize_bits(u8* dst, u8* src) {
    for every byte in the bitmap. We win that slot if there is no previous
    contender, or if the contender has smaller unique state count or
    it has a more favorable speed x size factor. */
+[[maybe_unused]]
 static void update_bitmap_score(std::shared_ptr<queue_entry> q) {
   const u64 fav_factor = q->exec_us * q->len;
   
@@ -1104,6 +1290,428 @@ static void update_bitmap_score(std::shared_ptr<queue_entry> q) {
   }
 }
 
+/**
+ * Iterate over queue, update top_rated array according to a bitmap.
+ * Make all queue entries be favored.
+ * If a queue entry is good enough, update pending_favored.
+ */
+[[maybe_unused]]
+static void cull_queue() {
+  if (dumb_mode || !score_changed) return;
+
+  static constexpr auto MAP_MINI = MAP_SIZE >> 3;
+  static std::array<u8, MAP_MINI> temp_v;
+
+  score_changed = false;
+  temp_v.fill(255);
+
+  for (auto const& q_ref: queue) {
+    queue_entry& q = *q_ref;
+    if (q.is_initial_seed) {
+      q.favored = false;
+    }
+  }
+
+  for (size_t i = 0; i < MAP_SIZE; i++) {
+    if (top_rated[i] != nullptr && (temp_v[i >> 3] & (1 << (i & 7)))) {
+      queue_entry& qi = *top_rated[i];
+      for (u32 j = MAP_SIZE >> 3; j > 0; j--) {
+
+        if (qi.trace_mini[j])
+          temp_v[j] &= ~qi.trace_mini[j];
+      }
+
+      qi.favored = true;
+      queued_favored++;
+
+      if ((qi.generating_state_id == target_state_id || qi.is_initial_seed) && 
+        (was_fuzzed_map[get_state_index(target_state_id)][qi.index] == FuzzedState::ReachableNotFuzzed))
+        pending_favored++;
+    }
+  }
+
+  for (auto const& q_ref: queue) {
+    mark_as_redundant(*q_ref, !q_ref->favored);
+  }
+}
+
+[[maybe_unused]]
+static void setup_shm(void) {
+  if (!in_bitmap) virgin_bits.fill(255);
+
+  virgin_tmout.fill(255);
+  virgin_crash.fill(255);
+
+  shm_id = shmget(IPC_PRIVATE, MAP_SIZE, IPC_CREAT | IPC_EXCL | 0600);
+
+  if (shm_id < 0) PFATAL("shmget() failed");
+
+  atexit(remove_shm);
+
+  std::string shm_str;
+  {
+    std::stringstream ss;
+    ss << shm_id;
+    shm_str = ss.str();
+  }
+
+  /* If somebody is asking us to fuzz instrumented binaries in dumb mode,
+     we don't want them to detect instrumentation, since we won't be sending
+     fork server commands. This should be replaced with better auto-detection
+     later on, perhaps? */
+
+  if (!dumb_mode) setenv(SHM_ENV_VAR, shm_str.c_str(), 1);
+
+  trace_bits = (u8*)shmat(shm_id, NULL, 0);
+
+  if (!trace_bits) PFATAL("shmat() failed");
+
+}
+
+[[maybe_unused]]
+static void setup_post() {
+  TODO();
+}
+
+[[maybe_unused]]
+static void read_testcases() {
+  // auto-detect non-in-place resumption attempts.
+  {
+    std::string fn = alloc_printf("%s/queue", in_dir.c_str());
+    if (!access(fn.c_str(), F_OK)) {
+      in_dir = std::move(fn);
+    }
+  }
+
+  namespace fs = std::filesystem;
+  try {
+    std::vector<std::string> files;
+    for (const auto& entry : fs::directory_iterator(in_dir)) {
+      if (fs::is_regular_file(entry)) {
+        files.emplace_back(entry.path().filename().string());
+      }
+    }
+
+    {
+      std::random_device rd;
+      std::mt19937 g(rd());
+      std::shuffle(files.begin(), files.end(), g);
+    }
+
+    for (const auto& file : files) {
+      auto fn = alloc_printf("%s/%s", in_dir, file.c_str());
+      auto dfn = alloc_printf("%s/.state/deterministic_done/%s", in_dir, file.c_str());
+      struct stat st;
+      bool passed_det = false;
+
+      if (lstat(fn.c_str(), &st) || access(fn.c_str(), R_OK))
+        PFATAL("Unable to access '%s'", fn.c_str());
+
+      if (!S_ISREG(st.st_mode) || !st.st_size) continue;
+
+      if (static_cast<size_t>(st.st_size) > MAX_FILE) {
+        FATAL("Test case '%s' is too big (%zd, limit is %zd)", fn.c_str(),
+            st.st_size, MAX_FILE);
+
+      }
+
+      if (!access(dfn.c_str(), F_OK)) passed_det = true;
+      
+      add_to_queue(fn, st.st_size, passed_det, 1);
+    }
+
+  } catch (std::exception const& e) {
+    PFATAL("Scan in_dir %s failed: %s", in_dir.c_str(), e.what());
+  }
+
+  if (queue.empty()) {
+    SAYF("\n" cLRD "[-] " cRST
+         "Looks like there are no valid test cases in the input directory! The fuzzer\n"
+         "    needs one or more test case to start with - ideally, a small file under\n"
+         "    1 kB or so. The cases must be stored as regular files directly in the\n"
+         "    input directory.\n");
+
+    FATAL("No usable test cases in '%s'", in_dir.c_str());
+  }
+
+  last_path_time = 0;
+}
+
+/*Move the current process to a new network namespace*/
+[[maybe_unused]]
+static void move_process_to_netns(std::string const& netns_name) {
+  auto const netns_path = alloc_printf("/var/run/netns/%s", netns_name.c_str());
+  if (netns_path.length() > 272) {
+    PFATAL("Network namespace name \"%s\" is too long", netns_name.c_str());
+  }
+
+  const int netns_fd = open(netns_path.c_str(), O_RDONLY);
+  if (netns_fd == -1) {
+    PFATAL("Unable to open %s", netns_path.c_str());
+  }
+  
+  if (setns(netns_fd, CLONE_NEWNET) == -1) {
+    PFATAL("setns failed");
+  }
+}
+
+/**
+ * Spin up forkserver (instrumented mode only)
+ */
+[[maybe_unused]]
+static void init_forkserver(int netns_id, char** argv) {
+  int st_pipe[2], ctl_pipe[2];
+
+  ACTF("Spinning up the fork server...");
+
+  if (pipe(st_pipe) || pipe(ctl_pipe)) {
+    PFATAL("pipe function failed");
+  }
+
+  forksrv_pid = fork();
+
+  if (forksrv_pid < 0) PFATAL("fork() failed");
+
+  if (!forksrv_pid) {
+    
+    struct rlimit r;
+
+    /* Umpf. On OpenBSD, the default fd limit for root users is set to
+       soft 128. Let's try to fix that... */
+    if (!getrlimit(RLIMIT_NOFILE, &r) && r.rlim_cur < FORKSRV_FD + 2) {
+      r.rlim_cur = FORKSRV_FD + 2;
+      setrlimit(RLIMIT_NOFILE, &r); /* Ignore errors */
+    }
+
+    if (mem_limit) {
+      r.rlim_max = r.rlim_cur = ((rlim_t)mem_limit) << 20;
+
+#ifdef RLIMIT_AS
+      setrlimit(RLIMIT_AS, &r); /* Ignore errors */
+#else
+      /* This takes care of OpenBSD, which doesn't have RLIMIT_AS, but
+         according to reliable sources, RLIMIT_DATA covers anonymous
+         maps - so we should be getting good protection against OOM bugs. */
+      setrlimit(RLIMIT_DATA, &r); /* Ignore errors */
+
+#endif /* ^RLIMIT_AS */
+    }
+
+    /* Dumping cores is slow and can lead to anomalies if SIGKILL is delivered
+       before the dump is complete. */
+    r.rlim_max = r.rlim_cur = 0;
+    setrlimit(RLIMIT_CORE, &r); /* Ignore errors */
+
+    /* Move process to a different network namespace */
+    move_process_to_netns(std::to_string(netns_id));
+
+    /* Isolate the process and configure standard descriptors. If out_file is
+       specified, stdin is /dev/null; otherwise, out_fd is cloned instead. */
+    setsid();
+    dup2(dev_null_fd, 1);
+    dup2(dev_null_fd, 2);
+
+    if (dup2(ctl_pipe[0], FORKSRV_FD) < 0) PFATAL("dup2() failed");
+    if (dup2(st_pipe[1], FORKSRV_FD + 1) < 0) PFATAL("dup2() failed");
+
+    close(ctl_pipe[0]);
+    close(ctl_pipe[1]);
+    close(st_pipe[0]);
+    close(st_pipe[1]);
+
+    close(dev_null_fd);
+
+    /* This should improve performance a bit, since it stops the linker from
+       doing extra work post-fork(). */
+
+    if (!getenv("LD_BIND_LAZY")) setenv("LD_BIND_NOW", "1", 0);
+
+    /* Set sane defaults for ASAN if nothing else specified. */
+
+    setenv("ASAN_OPTIONS", "abort_on_error=1:"
+                           "detect_leaks=0:"
+                           "symbolize=0:"
+                           "allocator_may_return_null=1", 0);
+
+    /* MSAN is tricky, because it doesn't support abort_on_error=1 at this
+       point. So, we do this in a very hacky way. */
+
+    setenv("MSAN_OPTIONS", "exit_code=" STRINGIFY(MSAN_ERROR) ":"
+                           "symbolize=0:"
+                           "abort_on_error=1:"
+                           "allocator_may_return_null=1:"
+                           "msan_track_origins=0", 0);
+
+    execv(target_path, argv);
+
+    /* Use a distinctive bitmap signature to tell the parent about execv()
+       falling through. */
+
+    *(u32*)trace_bits = EXEC_FAIL_SIG;
+    exit(0);
+  }
+
+  close(ctl_pipe[0]);
+  close(st_pipe[1]);
+
+  fsrv_st_fd = st_pipe[0];
+  fsrv_ctl_fd = ctl_pipe[1];
+
+  int status, rlen;
+  {
+    struct itimerval it;
+    /* Wait for the fork server to come up, but don't wait too long. */
+
+    it.it_value.tv_sec = ((exec_tmout * FORK_WAIT_MULT) / 1000);
+    it.it_value.tv_usec = ((exec_tmout * FORK_WAIT_MULT) % 1000) * 1000;
+
+    setitimer(ITIMER_REAL, &it, NULL);
+
+    rlen = read(fsrv_st_fd, &status, 4);
+
+    it.it_value.tv_sec = 0;
+    it.it_value.tv_usec = 0;
+
+    setitimer(ITIMER_REAL, &it, NULL);
+  }
+
+  /* If we have a four-byte "hello" message from the server, we're all set.
+     Otherwise, try to figure out what went wrong. */
+
+  if (rlen == 4) {
+    OKF("All right - fork server is up.");
+    return;
+  }
+
+  if (child_timed_out)
+    FATAL("Timeout while initializing fork server (adjusting -t may help)");
+
+  if (waitpid(forksrv_pid, &status, 0) <= 0)
+    PFATAL("waitpid() failed");
+
+  if (WIFSIGNALED(status)) {
+
+    if (mem_limit && mem_limit < 500 && uses_asan) {
+
+      SAYF("\n" cLRD "[-] " cRST
+           "Whoops, the target binary crashed suddenly, before receiving any input\n"
+           "    from the fuzzer! Since it seems to be built with ASAN and you have a\n"
+           "    restrictive memory limit configured, this is expected; please read\n"
+           "    %s/notes_for_asan.txt for help.\n", doc_path);
+
+    } else if (!mem_limit) {
+
+      SAYF("\n" cLRD "[-] " cRST
+           "Whoops, the target binary crashed suddenly, before receiving any input\n"
+           "    from the fuzzer! There are several probable explanations:\n\n"
+
+           "    - The binary is just buggy and explodes entirely on its own. If so, you\n"
+           "      need to fix the underlying problem or find a better replacement.\n\n"
+
+#ifdef __APPLE__
+
+           "    - On MacOS X, the semantics of fork() syscalls are non-standard and may\n"
+           "      break afl-fuzz performance optimizations when running platform-specific\n"
+           "      targets. To fix this, set AFL_NO_FORKSRV=1 in the environment.\n\n"
+
+#endif /* __APPLE__ */
+
+           "    - Less likely, there is a horrible bug in the fuzzer. If other options\n"
+           "      fail, poke <lcamtuf@coredump.cx> for troubleshooting tips.\n");
+
+    } else {
+
+      SAYF("\n" cLRD "[-] " cRST
+           "Whoops, the target binary crashed suddenly, before receiving any input\n"
+           "    from the fuzzer! There are several probable explanations:\n\n"
+
+           "    - The current memory limit (%s) is too restrictive, causing the\n"
+           "      target to hit an OOM condition in the dynamic linker. Try bumping up\n"
+           "      the limit with the -m setting in the command line. A simple way confirm\n"
+           "      this diagnosis would be:\n\n"
+
+#ifdef RLIMIT_AS
+           "      ( ulimit -Sv $[%llu << 10]; /path/to/fuzzed_app )\n\n"
+#else
+           "      ( ulimit -Sd $[%llu << 10]; /path/to/fuzzed_app )\n\n"
+#endif /* ^RLIMIT_AS */
+
+           "      Tip: you can use http://jwilk.net/software/recidivm to quickly\n"
+           "      estimate the required amount of virtual memory for the binary.\n\n"
+
+           "    - The binary is just buggy and explodes entirely on its own. If so, you\n"
+           "      need to fix the underlying problem or find a better replacement.\n\n"
+
+#ifdef __APPLE__
+
+           "    - On MacOS X, the semantics of fork() syscalls are non-standard and may\n"
+           "      break afl-fuzz performance optimizations when running platform-specific\n"
+           "      targets. To fix this, set AFL_NO_FORKSRV=1 in the environment.\n\n"
+
+#endif /* __APPLE__ */
+
+           "    - Less likely, there is a horrible bug in the fuzzer. If other options\n"
+           "      fail, poke <lcamtuf@coredump.cx> for troubleshooting tips.\n",
+           DMS(mem_limit << 20), mem_limit - 1);
+
+    }
+
+    FATAL("Fork server crashed with signal %d", WTERMSIG(status));
+
+  }
+
+  if (*(u32*)trace_bits == EXEC_FAIL_SIG)
+    FATAL("Unable to execute target application ('%s')", argv[0]);
+
+  if (mem_limit && mem_limit < 500 && uses_asan) {
+
+    SAYF("\n" cLRD "[-] " cRST
+           "Hmm, looks like the target binary terminated before we could complete a\n"
+           "    handshake with the injected code. Since it seems to be built with ASAN and\n"
+           "    you have a restrictive memory limit configured, this is expected; please\n"
+           "    read %s/notes_for_asan.txt for help.\n", doc_path);
+
+  } else if (!mem_limit) {
+
+    SAYF("\n" cLRD "[-] " cRST
+         "Hmm, looks like the target binary terminated before we could complete a\n"
+         "    handshake with the injected code. Perhaps there is a horrible bug in the\n"
+         "    fuzzer. Poke <lcamtuf@coredump.cx> for troubleshooting tips.\n");
+
+  } else {
+
+    SAYF("\n" cLRD "[-] " cRST
+         "Hmm, looks like the target binary terminated before we could complete a\n"
+         "    handshake with the injected code. There are %s probable explanations:\n\n"
+
+         "%s"
+         "    - The current memory limit (%s) is too restrictive, causing an OOM\n"
+         "      fault in the dynamic linker. This can be fixed with the -m option. A\n"
+         "      simple way to confirm the diagnosis may be:\n\n"
+
+#ifdef RLIMIT_AS
+         "      ( ulimit -Sv $[%llu << 10]; /path/to/fuzzed_app )\n\n"
+#else
+         "      ( ulimit -Sd $[%llu << 10]; /path/to/fuzzed_app )\n\n"
+#endif /* ^RLIMIT_AS */
+
+         "      Tip: you can use http://jwilk.net/software/recidivm to quickly\n"
+         "      estimate the required amount of virtual memory for the binary.\n\n"
+
+         "    - Less likely, there is a horrible bug in the fuzzer. If other options\n"
+         "      fail, poke <lcamtuf@coredump.cx> for troubleshooting tips.\n",
+         getenv(DEFER_ENV_VAR) ? "three" : "two",
+         getenv(DEFER_ENV_VAR) ?
+         "    - You are using deferred forkserver, but __AFL_INIT() is never\n"
+         "      reached before the program terminates.\n\n" : "",
+         DMS(mem_limit << 20), mem_limit - 1);
+
+  }
+
+  FATAL("Fork server handshake failed");
+}
+
 int main() {
   setup_fnames();
+  dev_null_fd = check_open("/dev/null", O_RDWR);
 }
